@@ -2,7 +2,7 @@
 -- Potassium: run this script after attaching to a Roblox client.
 -- Local artwork: workspace/Aero/aero-landscape.png
 -- Right Shift: show / hide. Drag the title bar to move.
--- v3.1: named config management, Aero details and explicit runtime table types.
+-- v3.2: dropdowns, text inputs, color pickers and Hold/Toggle keybinds.
 
 local CONFIG = {
     Title = "Aero",
@@ -31,7 +31,7 @@ local DEFAULTS = {
     Accent = "Ocean", Scale = 1, GlassOpacity = 0.88,
     Animations = true, SmoothDragging = true, Wallpaper = true, Shadows = true,
     LockPosition = false, RememberPosition = true, FreeMouse = true,
-    ToggleKey = "RightShift", Notifications = true, NotifyWhenHidden = true,
+    ToggleKey = "RightShift", ToggleMode = "Toggle", Notifications = true, NotifyWhenHidden = true,
     NotificationDuration = 4, NotificationLimit = 3, AutoSave = true,
 }
 local PALETTES = {
@@ -62,7 +62,8 @@ type RuntimeState = {
     RefreshSettings: any, RefreshToasts: any, RefreshPreview: any,
     DrawEspPreview: any, OpenConfig: any,
     SetMinimized: any, SettleVisibility: any,
-    UpdateBinding: any, UnbindHotkey: any,
+    UpdateBinding: any, UnbindHotkey: any, ShortcutHeld: boolean?,
+    KeyCapture: any, OnKeyBegan: any, OnKeyEnded: any, OnKeyFocusLost: any, CloseEditor: any,
     UpdateSlider: any, EndSlider: any, GroupFor: any, Relayout: any,
 }
 local state: RuntimeState = { Hidden = false, CapturingKey = false, Dirty = false, Controls = {},
@@ -75,6 +76,8 @@ local function validateSetting(key: string, value: any): any
         if type(value) ~= "number" or value ~= value or math.abs(value) == math.huge then return nil end
         return math.clamp(math.floor(value / rule[3] + 0.5) * rule[3], rule[1], rule[2])
     elseif key == "Accent" then return PALETTES[value] and value or nil
+    elseif key == "ToggleMode" then
+        if value == "Toggle" or value == "Hold" then return value end
     elseif key == "ToggleKey" then
         if type(value) ~= "string" or value == "Unknown" or value == "Escape" then return nil end
         local ok, keyCode = pcall(function() return Enum.KeyCode[value] end)
@@ -127,6 +130,13 @@ local function cancelTask(ticket)
     if thread then
         pendingTasks[ticket] = nil
         if thread ~= coroutine.running() then pcall(task.cancel, thread) end
+    end
+end
+local function cancelControlDrag(handle)
+    local active=state.SliderDrag
+    if active and (handle==nil or active.Handle==handle) then
+        state.SliderDrag=nil
+        if active.Cancel then active.Cancel() end
     end
 end
 local function schedule(seconds, callback)
@@ -237,6 +247,8 @@ local function icon(parent, kind, x, y, size, color)
         l(11, 12, 16, 0); l(16, 8, 11, 45); l(16, 16, 11, -45)
     elseif kind == "back" then
         l(13, 12, 16, 0); l(8, 8, 11, -45); l(8, 16, 11, 45)
+    elseif kind == "down" then
+        l(8,10,11,45); l(16,10,11,-45)
     elseif kind == "grid" then
         for row = 0, 1 do
             for col = 0, 1 do
@@ -543,6 +555,10 @@ local function selectPage(index)
     index = math.clamp(tonumber(index) or 1, 1, #pageList)
     index = math.floor(index)
     if state.TabDisabled and state.TabDisabled[index] then return false end
+    if index~=selectedPage then
+        cancelControlDrag()
+        if state.CloseEditor then state.CloseEditor() end
+    end
     selectedPage = index
     state.SelectedTab=index
     if index~=3 then state.CapturingKey=false;if state.RefreshSettings then state.RefreshSettings() end end
@@ -637,7 +653,9 @@ local function showWindow(show)
     end
     state.RefreshNavigation()
     dragging, dragTouch = false, nil
-    state.DragTarget, state.SliderDrag = nil, nil
+    state.DragTarget=nil
+    cancelControlDrag()
+    if hidden and state.CloseEditor then state.CloseEditor() end
     if activeTweens[anchor] then activeTweens[anchor]:Cancel() end
     state.VisibilityGeneration=(state.VisibilityGeneration or 0)+1
     local generation=state.VisibilityGeneration
@@ -672,24 +690,34 @@ state.SettleVisibility=function()
 end
 
 local function shortcutBegan(input)
-    if not alive or state.CapturingKey or input.KeyCode~=Enum.KeyCode[preferences.ToggleKey] then return false end
+    if not alive or state.CapturingKey or state.KeyCapture or input.KeyCode~=Enum.KeyCode[preferences.ToggleKey] then return false end
     if state.TogglePressed==input.KeyCode then return not UIS:GetFocusedTextBox() end
     state.TogglePressed=input.KeyCode
     if UIS:GetFocusedTextBox() then return false end
-    showWindow(hidden)
+    state.ShortcutHeld=preferences.ToggleMode=="Hold"
+    showWindow(state.ShortcutHeld or hidden)
     return true
 end
-connect(UIS.InputBegan, function(input, _processed)
+local function endShortcut(key)
+    if key and state.TogglePressed~=key then return end
+    state.TogglePressed=nil
+    if state.ShortcutHeld then
+        state.ShortcutHeld=false
+        showWindow(false)
+    end
+end
+connect(UIS.InputBegan, function(input, processed)
     if state.CapturingKey then
         if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
         state.CapturingKey = false
         if input.KeyCode ~= Enum.KeyCode.Escape then api.SetSetting("ToggleKey", input.KeyCode.Name) end
-        state.TogglePressed=input.KeyCode -- A captured key must be released before it can toggle.
+        if input.KeyCode==Enum.KeyCode[preferences.ToggleKey] then state.TogglePressed=input.KeyCode end
         if state.RefreshSettings then state.RefreshSettings() end
         return
     end
     -- Only the explicitly selected shortcut bypasses gameProcessedEvent.
-    shortcutBegan(input)
+    local shortcutHandled=shortcutBegan(input)
+    if state.OnKeyBegan then state.OnKeyBegan(input,processed or shortcutHandled) end
 end)
 do
     local ok,actions=pcall(function() return game:GetService("ContextActionService") end)
@@ -698,15 +726,14 @@ do
         local boundKey
         state.UpdateBinding=function()
             if boundKey==preferences.ToggleKey then return end
-            state.TogglePressed=nil
             local key=preferences.ToggleKey
             local success=pcall(function()
                 actions:UnbindAction(actionName)
                 actions:BindActionAtPriority(actionName,function(_,inputState,input)
-                    local handle=alive and not state.CapturingKey and not UIS:GetFocusedTextBox()
+                    local handle=alive and not state.CapturingKey and not state.KeyCapture and not UIS:GetFocusedTextBox()
                     if inputState==Enum.UserInputState.Begin then handle=shortcutBegan(input)
-                    elseif inputState==Enum.UserInputState.Cancel then state.TogglePressed=nil
-                    elseif inputState==Enum.UserInputState.End and state.TogglePressed==input.KeyCode then state.TogglePressed=nil end
+                    elseif inputState==Enum.UserInputState.Cancel then endShortcut()
+                    elseif inputState==Enum.UserInputState.End then endShortcut(input.KeyCode) end
                     -- Reserve only the chosen shortcut; do not open chat/camera actions with it.
                     return handle and Enum.ContextActionResult.Sink or Enum.ContextActionResult.Pass
                 end,false,Enum.ContextActionPriority.High.Value+100,Enum.KeyCode[key])
@@ -739,7 +766,8 @@ connect(UIS.InputChanged, function(input)
     state.DragTarget = {X=x,Y=y}
 end)
 connect(UIS.InputEnded, function(input)
-    if state.TogglePressed==input.KeyCode then state.TogglePressed=nil end
+    endShortcut(input.KeyCode)
+    if state.OnKeyEnded then state.OnKeyEnded(input) end
     if state.EndSlider then state.EndSlider(input) end
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input == dragTouch then
         dragging, dragTouch = false, nil
@@ -753,17 +781,23 @@ connect(UIS.InputEnded, function(input)
 end)
 connect(UIS.WindowFocusReleased, function()
     dragging, dragTouch = false, nil
-    state.SliderDrag = nil
+    cancelControlDrag()
     state.DragTarget = nil
     if activeTweens[anchor] then activeTweens[anchor]:Cancel() end
     state.CapturingKey = false
-    state.TogglePressed=nil
+    endShortcut()
+    if state.CloseEditor then state.CloseEditor() end
+    if state.OnKeyFocusLost then state.OnKeyFocusLost() end
     if state.RefreshSettings then state.RefreshSettings() end
 end)
 
 local function setMinimized(value)
     if not alive then return end
     minimized=value==true
+    if minimized then
+        cancelControlDrag()
+        if state.CloseEditor then state.CloseEditor() end
+    end
     state.Minimized=minimized
     state.RefreshNavigation()
     state.MinimizeGeneration=(state.MinimizeGeneration or 0)+1
@@ -921,6 +955,25 @@ do
         end
     end
     state.GroupFor, state.Relayout = groupFor, relayout
+    local editor
+    local function closeEditor(owner)
+        if not editor or (owner and owner~=editor) then return end
+        local previous=editor
+        editor=nil
+        cancelControlDrag(previous.Handle)
+        if state.KeyCapture==previous then state.KeyCapture=nil end
+        previous.Refresh()
+    end
+    local function openEditor(data)
+        local wasOpen=editor==data
+        closeEditor()
+        if not wasOpen then
+            editor=data
+            return true
+        end
+        return false
+    end
+    state.CloseEditor=closeEditor
     local function callbackError(message)
         warn("[Aero callback] "..tostring(message))
         api.Notify({Id="aero.callback-error",Title="That action hit a problem",Text="The rest of the interface is still available.",Type="error"})
@@ -961,12 +1014,22 @@ do
         function methods:SetDisabled(value)
             if not alive or data.Destroyed then return end
             data.Disabled=value==true
-            if data.Disabled and state.SliderDrag and state.SliderDrag.Handle==handle then state.SliderDrag=nil end
+            if data.Disabled then
+                cancelControlDrag(handle)
+                closeEditor(data)
+                if data.OnUnavailable then data.OnUnavailable() end
+            end
             data.Refresh()
         end
         function methods:SetVisible(value)
             if not alive or data.Destroyed then return end
-            data.Visible=value~=false;object.Visible=data.Visible;relayout(group)
+            data.Visible=value~=false
+            if not data.Visible then
+                cancelControlDrag(handle)
+                closeEditor(data)
+                if data.OnUnavailable then data.OnUnavailable() end
+            end
+            object.Visible=data.Visible;relayout(group)
         end
         function methods:GetValue() return data.Value end
         function methods:SetButtonState(value)
@@ -982,14 +1045,18 @@ do
             if data.Normalize then value=data.Normalize(value) end
             if value==nil then return false end
             if data.Value==value then data.Refresh();return false end
-            data.Value=value;data.Refresh()
+            data.Value=value
+            if data.OnValueChanged then data.OnValueChanged() end
+            data.Refresh()
             if fireCallback then data.Invoke(value) end
             return true
         end
         function methods:Destroy()
             if data.Destroyed then return end
             data.Destroyed=true;cancelTask(data.Job);cancelTask(data.FeedbackTask)
-            if state.SliderDrag and state.SliderDrag.Handle==handle then state.SliderDrag=nil end
+            closeEditor(data)
+            cancelControlDrag(handle)
+            if data.OnDestroy then data.OnDestroy() end
             state.Controls[id]=nil
             local index=table.find(group.Items,handle)
             if index then table.remove(group.Items,index) end
@@ -1040,10 +1107,11 @@ do
                 elseif key=="Value" then methods.SetValue(handle,value,false)
                 elseif key=="Text" or key=="Description" then data[key]=tostring(value);data.Refresh()
                 elseif key=="ButtonText" and kind=="Button" then data.ButtonText=tostring(value);data.Refresh()
+                elseif key=="Mode" and methods.SetMode then methods.SetMode(handle,value)
                 else error("Use control methods; '"..tostring(key).."' is read-only",2) end
             end,
         })
-        data.Handle=handle;data.Title=title;data.DescriptionLabel=description
+        data.Handle=handle;data.Title=title;data.DescriptionLabel=description;data.Methods=methods
         state.Controls[id]=handle
         table.insert(group.Items,handle)
         object.Visible=data.Visible
@@ -1151,7 +1219,7 @@ do
             if size>0 then handle:SetValue(minimum+math.clamp((input.Position.X-track.AbsolutePosition.X)/size,0,1)*(maximum-minimum),true) end
         end
         connect(track.InputBegan,function(input)
-            if data.Disabled or data.Busy then return end
+            if data.Disabled or data.Busy or state.SliderDrag then return end
             if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
                 state.SliderDrag={Handle=handle,Touch=input.UserInputType==Enum.UserInputType.Touch and input or nil,Update=pointerValue}
                 pointerValue(input)
@@ -1161,13 +1229,431 @@ do
         connect(plus.Activated,function() handle:SetValue(data.Value+step,true) end,data.Instance)
         data.Refresh();return handle
     end
+    local function placeField(data, fraction)
+        local width=data.Instance.Size.X.Offset
+        local fieldWidth=math.min(174,math.floor(width*fraction))
+        local x=width-fieldWidth-15
+        data.Title.Size=UDim2.fromOffset(math.max(0,x-30),25)
+        data.DescriptionLabel.Size=UDim2.fromOffset(math.max(0,x-30),24)
+        return x,fieldWidth
+    end
+    local function enableWidget(object, enabled)
+        object.Active=enabled
+        object.Selectable=enabled
+        object.Interactable=enabled
+    end
+    local function textField(parent,name,placeholder,x,y,width)
+        local input=create("TextBox",{
+            Name=name,Text="",PlaceholderText=placeholder,PlaceholderColor3=MUTED,
+            ClearTextOnFocus=false,Font=Enum.Font.SourceSansSemibold,TextSize=16,TextColor3=INK,
+            TextXAlignment=Enum.TextXAlignment.Left,BackgroundColor3=WHITE,BackgroundTransparency=0.25,
+            BorderSizePixel=0,Position=UDim2.fromOffset(x,y),Size=UDim2.fromOffset(width,27),
+        },parent)
+        round(input,5);stroke(input,rgb(145,188,205),0.3)
+        create("UIPadding",{PaddingLeft=UDim.new(0,8),PaddingRight=UDim.new(0,8)},input)
+        return input
+    end
+    local function renderTextField(input,disabled)
+        enableWidget(input,not disabled)
+        input.TextEditable=not disabled
+        input.TextTransparency=disabled and 0.5 or 0
+        input.BackgroundTransparency=disabled and 0.55 or 0.25
+    end
+    local function renderFieldButton(object,disabled)
+        enableWidget(object,not disabled)
+        local veil=object:FindFirstChild("DisabledVeil")
+        if not veil then
+            veil=frame(object,"DisabledVeil",0,0,object.Size.X.Offset,object.Size.Y.Offset,rgb(221,232,235),0.4,8)
+            veil.ZIndex=5
+        end
+        veil.Visible=disabled
+    end
+    local function renderEditor(data,panel,baseHeight)
+        local expanded=editor==data
+        panel.Visible=expanded
+        local height=expanded and (baseHeight+panel.Size.Y.Offset+8) or baseHeight
+        if height~=data.Height then
+            data.Height=height
+            data.Instance.Size=UDim2.fromOffset(data.Instance.Size.X.Offset,height)
+            relayout(data.Group)
+        end
+        return expanded
+    end
+
+    function api.AddDropdown(first,secondOptions)
+        local options=arguments(first,secondOptions)
+        assert(type(options)=="table" and type(options.Options)=="table","Dropdown requires an Options array")
+        local choices, allowed={},{}
+        for _,choice in ipairs(options.Options) do
+            assert(type(choice)=="string" and choice~="","Dropdown options must be nonempty strings")
+            if not allowed[choice] then
+                allowed[choice]=true
+                table.insert(choices,choice)
+            end
+        end
+        local baseHeight=options.Compact and 56 or 70
+        local handle,fresh,data=makeControl("Dropdown",options,baseHeight)
+        if not fresh then return handle end
+        data.Normalize=function(value)
+            if type(value)=="string" and allowed[value] then return value end
+        end
+        data.Value=data.Normalize(options.Default) or choices[1] or ""
+        local x,width=placeField(data,0.43)
+        local action=button(data.Instance,"Dropdown",data.Value,x,math.floor((baseHeight-35)/2),width,35,false,"down")
+        local caption=action.Caption
+        caption.TextSize=16
+        local panelWidth=data.Instance.Size.X.Offset-30
+        local rows=math.min(#choices,4)
+        local scrollable=#choices>rows
+        local panel=create("ScrollingFrame",{
+            Name="Options",Position=UDim2.fromOffset(15,baseHeight),
+            Size=UDim2.fromOffset(panelWidth,rows*35),CanvasSize=UDim2.fromOffset(0,#choices*35),
+            BackgroundTransparency=1,BorderSizePixel=0,Active=scrollable,ScrollingEnabled=scrollable,
+            ScrollingDirection=Enum.ScrollingDirection.Y,ScrollBarThickness=5,ScrollBarImageColor3=rgb(102,161,180),
+            Visible=false,
+        },data.Instance)
+        local entries={}
+        for index,choice in ipairs(choices) do
+            local itemWidth=panelWidth-(scrollable and 10 or 2)
+            local item=button(panel,"Option"..index,choice,1,(index-1)*35+2,itemWidth,29,false)
+            item.Caption.Position=UDim2.fromOffset(12,0)
+            item.Caption.Size=UDim2.fromOffset(itemWidth-24,29)
+            item.Caption.TextXAlignment=Enum.TextXAlignment.Left
+            item.Caption.TextSize=16
+            entries[choice]=item
+            connect(item.Activated,function()
+                if editor~=data then return end
+                closeEditor(data)
+                handle:SetValue(choice,true)
+            end,item)
+        end
+        connect(action.Activated,function()
+            if data.Disabled or data.Busy or #choices==0 then return end
+            if openEditor(data) then
+                local selected=table.find(choices,data.Value) or 1
+                panel.CanvasPosition=Vector2.new(0,math.clamp(selected-1,0,#choices-rows)*35)
+            end
+            data.Refresh()
+        end,action)
+        data.Render=function(disabled)
+            local expanded=renderEditor(data,panel,baseHeight)
+            caption.Text=data.Value~="" and data.Value or (options.Placeholder or "No options")
+            action.Icon_down.Rotation=expanded and 180 or 0
+            renderFieldButton(action,disabled or #choices==0)
+            for choice,item in pairs(entries) do
+                item.BackgroundColor3=choice==data.Value and PALETTES[preferences.Accent][3] or WHITE
+                enableWidget(item,expanded and not disabled)
+            end
+        end
+        data.Refresh()
+        return handle
+    end
+
+    function api.AddTextInput(first,secondOptions)
+        local options=arguments(first,secondOptions)
+        local handle,fresh,data=makeControl("TextInput",options,options.Compact and 56 or 70)
+        if not fresh then return handle end
+        data.Normalize=function(value)
+            if type(value)=="string" then return (value:gsub("[\r\n]","")) end
+        end
+        data.Value=data.Normalize(options.Default) or ""
+        local x,width=placeField(data,0.43)
+        local input=textField(data.Instance,"TextInput",options.Placeholder or "",x,math.floor((data.Height-27)/2),width)
+        local renderedValue
+        data.OnUnavailable=function()
+            input.Text=data.Value
+            if input:IsFocused() then input:ReleaseFocus(false) end
+        end
+        data.Render=function(disabled)
+            if not input:IsFocused() or renderedValue~=data.Value then input.Text=data.Value end
+            renderedValue=data.Value
+            renderTextField(input,disabled)
+        end
+        connect(input.FocusLost,function(_,event)
+            if data.Visible and not data.Disabled and not (event and event.KeyCode==Enum.KeyCode.Escape) then
+                handle:SetValue(input.Text,true)
+            end
+            data.Refresh()
+        end,input)
+        data.Refresh()
+        return handle
+    end
+
+    function api.AddColorPicker(first,secondOptions)
+        local options=arguments(first,secondOptions)
+        local baseHeight=options.Compact and 56 or 70
+        local handle,fresh,data=makeControl("ColorPicker",options,baseHeight)
+        if not fresh then return handle end
+        data.Normalize=function(value)
+            if typeof(value)=="Color3" then
+                if value.R==value.R and value.G==value.G and value.B==value.B then
+                    return Color3.new(math.clamp(value.R,0,1),math.clamp(value.G,0,1),math.clamp(value.B,0,1))
+                end
+            elseif type(value)=="string" then
+                local r,g,b=value:match("^%s*#?(%x%x)(%x%x)(%x%x)%s*$")
+                if r then return rgb(tonumber(r,16),tonumber(g,16),tonumber(b,16)) end
+            end
+        end
+        data.Value=data.Normalize(options.Default) or PALETTES[preferences.Accent][1]
+        local x,width=placeField(data,0.35)
+        local chooser=button(data.Instance,"ColorPicker","",x,math.floor((baseHeight-35)/2),width,35,false,"down")
+        local swatch=frame(chooser,"Swatch",8,8,22,19,data.Value,0,5)
+        stroke(swatch,WHITE,0.15);gloss(swatch,2,1,18,8,4)
+        local caption=chooser.Caption
+        caption.Position=UDim2.fromOffset(37,0)
+        caption.Size=UDim2.fromOffset(math.max(0,width-67),35)
+        caption.TextSize=16
+
+        local panelWidth=data.Instance.Size.X.Offset-30
+        local panel=frame(data.Instance,"Picker",15,baseHeight,panelWidth,145,WHITE,1)
+        local hexWidth=math.min(114,math.floor(panelWidth*0.32))
+        local shadeWidth=panelWidth-hexWidth-40
+        local function surface(name,left,w)
+            local target=create("TextButton",{
+                Name=name,Text="",AutoButtonColor=false,BorderSizePixel=0,Selectable=false,
+                Position=UDim2.fromOffset(left,2),Size=UDim2.fromOffset(w,139),
+            },panel)
+            round(target,6);stroke(target,rgb(145,188,205),0.3)
+            return target
+        end
+        local shade=surface("SaturationValue",0,shadeWidth)
+        local light=frame(shade,"Saturation",0,0,shadeWidth,139,WHITE,0,6)
+        gradient(light,{{0,WHITE},{1,WHITE}},0,{{0,0},{1,1}})
+        local dark=frame(shade,"Value",0,0,shadeWidth,139,rgb(0,0,0),0,6)
+        dark.ZIndex=2
+        gradient(dark,{{0,WHITE},{1,WHITE}},90,{{0,1},{1,0}})
+        local marker=frame(shade,"Selection",0,0,12,12,WHITE,0,6)
+        marker.AnchorPoint=Vector2.new(0.5,0.5);marker.ZIndex=3
+        stroke(marker,WHITE,0,2)
+        local hueBar=surface("Hue",shadeWidth+8,24)
+        local hueColors={}
+        for index=0,6 do table.insert(hueColors,{index/6,Color3.fromHSV(index/6,1,1)}) end
+        gradient(hueBar,hueColors)
+        local hueMarker=frame(hueBar,"Selection",0,0,24,6,WHITE,0.18,3)
+        hueMarker.AnchorPoint=Vector2.new(0,0.5)
+        stroke(hueMarker,rgb(88,136,153),0.26)
+        local hex=textField(panel,"HexInput","#RRGGBB",panelWidth-hexWidth,2,hexWidth)
+        hex.TextXAlignment=Enum.TextXAlignment.Center
+
+        local hue,saturation,value=data.Value:ToHSV()
+        local draft
+        data.OnValueChanged=function()
+            cancelControlDrag(handle)
+            local nextHue,nextSaturation,nextValue=data.Value:ToHSV()
+            if nextSaturation>0 then hue=nextHue end
+            saturation,value=nextSaturation,nextValue
+        end
+        data.Render=function(disabled)
+            local expanded=renderEditor(data,panel,baseHeight)
+            local color=draft or data.Value
+            local formatted="#"..color:ToHex():upper()
+            swatch.BackgroundColor3=color
+            caption.Text=formatted
+            chooser.Icon_down.Rotation=expanded and 180 or 0
+            shade.BackgroundColor3=Color3.fromHSV(hue,1,1)
+            marker.BackgroundColor3=color
+            marker.Position=UDim2.fromScale(saturation,1-value)
+            hueMarker.Position=UDim2.fromScale(0,hue)
+            if not expanded and hex:IsFocused() then hex:ReleaseFocus(false) end
+            if not hex:IsFocused() then hex.Text=formatted end
+            renderFieldButton(chooser,disabled)
+            renderTextField(hex,disabled or not expanded)
+        end
+        local function startDrag(surfaceObject,input,isHue)
+            if data.Disabled or data.Busy or editor~=data or state.SliderDrag then return end
+            local touch=input.UserInputType==Enum.UserInputType.Touch
+            if not touch and input.UserInputType~=Enum.UserInputType.MouseButton1 then return end
+            local scroller=touch and surfaceObject:FindFirstAncestorWhichIsA("ScrollingFrame")
+            local restoreScroll=scroller and scroller.ScrollingEnabled
+            if restoreScroll then scroller.ScrollingEnabled=false end
+            local startHue,startSaturation,startValue=hue,saturation,value
+            local function update(position)
+                local offset=surfaceObject.AbsolutePosition
+                local size=surfaceObject.AbsoluteSize
+                if size.X<=0 or size.Y<=0 then return end
+                local across=math.clamp((position.Position.X-offset.X)/size.X,0,1)
+                local down=math.clamp((position.Position.Y-offset.Y)/size.Y,0,1)
+                if isHue then hue=math.min(down,0.999999)
+                else saturation,value=across,1-down end
+                draft=Color3.fromHSV(hue,saturation,value)
+                data.Refresh()
+            end
+            state.SliderDrag={
+                Handle=handle,Touch=touch and input or nil,Update=update,
+                Finish=function()
+                    if restoreScroll then scroller.ScrollingEnabled=true end
+                    local result=draft
+                    draft=nil
+                    if result then handle:SetValue(result,true) end
+                    data.Refresh()
+                end,
+                Cancel=function()
+                    if restoreScroll then scroller.ScrollingEnabled=true end
+                    draft=nil
+                    hue,saturation,value=startHue,startSaturation,startValue
+                    data.Refresh()
+                end,
+            }
+            update(input)
+        end
+        connect(chooser.Activated,function()
+            if data.Disabled or data.Busy then return end
+            openEditor(data)
+            data.Refresh()
+        end,chooser)
+        connect(shade.InputBegan,function(input) startDrag(shade,input,false) end,shade)
+        connect(hueBar.InputBegan,function(input) startDrag(hueBar,input,true) end,hueBar)
+        connect(hex.FocusLost,function(_,event)
+            if editor==data and not (event and event.KeyCode==Enum.KeyCode.Escape) then
+                handle:SetValue(hex.Text,true)
+            end
+            data.Refresh()
+        end,hex)
+        data.Refresh()
+        return handle
+    end
+
+    local keybinds,pressedKeys={},{}
+    local function keyCode(value)
+        if type(value)=="string" then
+            local ok,item=pcall(function() return Enum.KeyCode[value] end)
+            value=ok and item or nil
+        end
+        if typeof(value)=="EnumItem" and value.EnumType==Enum.KeyCode and value~=Enum.KeyCode.Escape then
+            return value
+        end
+    end
+    function api.AddKeybind(first,secondOptions)
+        local options=arguments(first,secondOptions)
+        assert(type(options)=="table","Keybind options must be a table")
+        local mode=options.Mode or "Toggle"
+        assert(validateSetting("ToggleMode",mode),"Keybind Mode must be Toggle or Hold")
+        local handle,fresh,data=makeControl("Keybind",options,options.Compact and 56 or 70)
+        if not fresh then return handle end
+        data.Normalize=keyCode
+        data.Value=keyCode(options.Default or options.Key) or Enum.KeyCode.Unknown
+        data.Mode=mode
+        data.Active=false
+        data.Callback=options.Changed
+        local x,width=placeField(data,0.47)
+        local y=math.floor((data.Height-35)/2)
+        local modeWidth=math.min(65,math.floor(width*0.42))
+        local keyButton=button(data.Instance,"Binding","",x,y,width-modeWidth-8,35,false)
+        local modeButton=button(data.Instance,"Mode",mode,x+width-modeWidth,y,modeWidth,35,false)
+        keyButton.Caption.TextSize=16
+        modeButton.Caption.TextSize=16
+
+        local transitions={}
+        local activeJob
+        function data.SetActive(active)
+            if data.Active==active or data.Destroyed then return end
+            data.Active=active
+            data.Refresh()
+            if type(options.Callback)~="function" then return end
+            table.insert(transitions,active)
+            if activeJob then return end
+            local ticket={}
+            activeJob=ticket
+            pendingTasks[ticket]=task.defer(function()
+                local index=1
+                while alive and not data.Destroyed and transitions[index]~=nil do
+                    local ok,message=xpcall(options.Callback,debug.traceback,transitions[index],handle)
+                    if not ok and alive and not data.Destroyed then callbackError(message) end
+                    index+=1
+                end
+                pendingTasks[ticket]=nil
+                activeJob=nil
+                table.clear(transitions)
+            end)
+        end
+        data.OnValueChanged=function() data.SetActive(false) end
+        data.OnUnavailable=data.OnValueChanged
+        data.OnDestroy=function()
+            keybinds[handle]=nil
+            cancelTask(activeJob)
+            table.clear(transitions)
+            data.Active=false
+        end
+        function data.Methods:SetMode(nextMode)
+            if not alive or data.Destroyed or not validateSetting("ToggleMode",nextMode) then return false end
+            if data.Mode==nextMode then return true end
+            closeEditor(data)
+            data.Mode=nextMode
+            data.SetActive(false)
+            data.Refresh()
+            return true
+        end
+        data.Render=function(disabled)
+            keyButton.Caption.Text=state.KeyCapture==data and "Press key…" or data.Value.Name
+            if data.Value==Enum.KeyCode.Unknown and state.KeyCapture~=data then keyButton.Caption.Text="Unbound" end
+            keyButton.BackgroundColor3=data.Active and PALETTES[preferences.Accent][3] or WHITE
+            modeButton.Caption.Text=data.Mode
+            renderFieldButton(keyButton,disabled)
+            renderFieldButton(modeButton,disabled)
+        end
+        connect(keyButton.Activated,function()
+            if data.Disabled or data.Busy then return end
+            if openEditor(data) then
+                state.CapturingKey=false
+                state.KeyCapture=data
+                if state.RefreshSettings then state.RefreshSettings() end
+            end
+            data.Refresh()
+        end,keyButton)
+        connect(modeButton.Activated,function()
+            if not data.Disabled and not data.Busy then
+                handle:SetMode(data.Mode=="Hold" and "Toggle" or "Hold")
+            end
+        end,modeButton)
+        keybinds[handle]=data
+        data.Refresh()
+        return handle
+    end
+    function state.OnKeyBegan(input,processed)
+        if input.UserInputType~=Enum.UserInputType.Keyboard then return end
+        local key=input.KeyCode
+        if key==Enum.KeyCode.Unknown or pressedKeys[key] then return end
+        pressedKeys[key]=true
+        local capture=state.KeyCapture
+        if capture then
+            if UIS:GetFocusedTextBox() then return end
+            if key==Enum.KeyCode[preferences.ToggleKey] then state.TogglePressed=key end
+            closeEditor(capture)
+            if key~=Enum.KeyCode.Escape then capture.Handle:SetValue(key,true) end
+            return
+        end
+        if processed or UIS:GetFocusedTextBox() or key==Enum.KeyCode[preferences.ToggleKey] then return end
+        for _,binding in pairs(keybinds) do
+            if binding.Visible and not binding.Disabled and binding.Value==key then
+                binding.SetActive(binding.Mode=="Hold" or not binding.Active)
+            end
+        end
+    end
+    function state.OnKeyEnded(input)
+        if input.UserInputType~=Enum.UserInputType.Keyboard then return end
+        local key=input.KeyCode
+        pressedKeys[key]=nil
+        for _,binding in pairs(keybinds) do
+            if binding.Mode=="Hold" and binding.Value==key then binding.SetActive(false) end
+        end
+    end
+    function state.OnKeyFocusLost()
+        table.clear(pressedKeys)
+        for _,binding in pairs(keybinds) do
+            if binding.Mode=="Hold" then binding.SetActive(false) end
+        end
+    end
+
     function state.UpdateSlider(input)
         local active=state.SliderDrag
         if active and ((active.Touch and input==active.Touch) or (not active.Touch and input.UserInputType==Enum.UserInputType.MouseMovement)) then active.Update(input) end
     end
     function state.EndSlider(input)
         local active=state.SliderDrag
-        if active and (input==active.Touch or input.UserInputType==Enum.UserInputType.MouseButton1) then state.SliderDrag=nil end
+        if active and ((active.Touch and input==active.Touch) or (not active.Touch and input.UserInputType==Enum.UserInputType.MouseButton1)) then
+            state.SliderDrag=nil
+            if active.Finish then active.Finish() end
+        end
     end
     function api.GetControl(first,id) return state.Controls[first==api and id or first] end
     function api.SetTabDisabled(first,index,value)
@@ -1444,6 +1930,10 @@ do
         end
     end
     local function selectCategory(index)
+        if index~=selectedCategory then
+            cancelControlDrag()
+            state.CloseEditor()
+        end
         selectedCategory=index;state.CapturingKey=false
         scroller.CanvasPosition=Vector2.new(0,0)
         for i,view in ipairs(categories) do
@@ -1497,6 +1987,7 @@ do
         if first==api then first=silent end
         return saveSettings(first==true)
     end
+    local appliedKey,appliedMode
     local function applySettings()
         shell.BackgroundTransparency=1-preferences.GlassOpacity
         paper.BackgroundTransparency=1-(0.55+0.43*preferences.GlassOpacity)
@@ -1505,9 +1996,16 @@ do
         hill.Visible=preferences.Wallpaper
         for i=1,5 do window["Shadow"..i].Visible=preferences.Shadows end
         dragSurface.Modal=preferences.FreeMouse and not hidden
+        if appliedKey~=preferences.ToggleKey or appliedMode~=preferences.ToggleMode then
+            local pressed=state.TogglePressed
+            endShortcut()
+            if appliedKey==preferences.ToggleKey then state.TogglePressed=pressed end
+            appliedKey,appliedMode=preferences.ToggleKey,preferences.ToggleMode
+            if appliedMode=="Hold" and not hidden then showWindow(false) end
+        end
         if state.UpdateBinding then state.UpdateBinding() end
         if preferences.LockPosition then dragging=false;state.DragTarget=nil end
-        shortcut.Text=preferences.ToggleKey.."  ·  Toggle menu"
+        shortcut.Text=preferences.ToggleKey.."  ·  "..(preferences.ToggleMode=="Hold" and "Hold to show menu" or "Toggle menu")
         state.RefreshNavigation()
         if not preferences.Animations then
             state.SettleVisibility()
@@ -1594,13 +2092,18 @@ do
     toggle(right,"Shadows","Window shadow","Add a soft shadow beneath the glass.")
     left,right=categories[2].Left,categories[2].Right
     heading(left,"YOUR SHORTCUTS")
-    local keyControl=api.AddButton({Id="settings.Shortcut",Parent=left,Text="Toggle shortcut",Description="RightShift",ButtonText="Change",SuccessFeedback=false,Callback=function()
+    local keyControl=api.AddButton({Id="settings.Shortcut",Parent=left,Text="Window shortcut",Description="RightShift",ButtonText="Change",SuccessFeedback=false,Callback=function()
+        state.CloseEditor()
         state.CapturingKey=not state.CapturingKey;refreshSettings()
     end})
     table.insert(state.Refreshers,function()
         keyControl.Description=state.CapturingKey and "Press a key. Escape cancels." or preferences.ToggleKey
         keyControl:SetButtonState(state.CapturingKey and "waiting" or "default")
     end)
+    local shortcutMode=api.AddDropdown({Id="settings.ShortcutMode",Parent=left,Text="Shortcut mode",
+        Description="Press to toggle or hold to show.",Options={"Toggle","Hold"},Default=preferences.ToggleMode,
+        Callback=function(mode) api.SetSetting("ToggleMode",mode) end})
+    table.insert(state.Refreshers,function() shortcutMode:SetValue(preferences.ToggleMode) end)
     toggle(left,"LockPosition","Lock window position","Prevent accidental dragging.")
     toggle(left,"RememberPosition","Remember position","Reopen the UI where you left it.")
     heading(right,"YOUR WINDOW")
@@ -1833,6 +2336,6 @@ do
     if autoConfigName and store.Profiles[autoConfigName] then api.LoadConfig(autoConfigName,true) end
 end
 connect(gui.Destroying,function() state.ExternalDestroy=true;api.Destroy() end)
-api.Version="3.1.0"
+api.Version="3.2.0"
 -- See API-Examples.luau for independent, copyable extension examples.
 return api
